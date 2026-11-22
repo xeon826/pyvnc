@@ -879,8 +879,31 @@ class VNCClient:
         )
 
     # 6
-    async def _client_cut_text(self) -> None:
-        raise NotImplementedError
+    async def _client_cut_text(self, text: str) -> None:
+        """Send ClientCutText: set the guest machine's clipboard to *text*.
+
+        RFC 6143 section 7.6.3 encodes cut text as ISO 8859-1; Latin-1 is used
+        when the text fits, falling back to UTF-8 otherwise (most modern
+        servers interpret the bytes accordingly). Sets overwrite whatever is
+        currently on the guest clipboard.
+        """
+        try:
+            payload = text.encode("latin-1")
+        except UnicodeEncodeError:
+            payload = text.encode("utf-8")
+        await self._safe_write(
+            b"\x06\x00\x00\x00" + len(payload).to_bytes(4, "big") + payload
+        )
+
+    async def set_clipboard(self, text: str) -> "VNCClient":
+        """Set the guest machine's clipboard to *text* (ClientCutText).
+
+        The guest can then paste it (Ctrl+V / Shift+Insert in a Windows
+        console). This overwrites whatever is currently on the guest
+        clipboard.
+        """
+        await self._client_cut_text(text)
+        return self
 
     async def capture(
         self,

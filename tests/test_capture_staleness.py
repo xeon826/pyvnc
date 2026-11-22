@@ -60,6 +60,7 @@ class ScriptedUpdateServer(MockRFBServer):
         self.script = list(script)
         self._index = 0
         self.requests = 0
+        self.clipboard_texts: list[str] = []
 
     async def _serve_messages(self, reader, writer):
         while True:
@@ -81,6 +82,12 @@ class ScriptedUpdateServer(MockRFBServer):
                 await reader.readexactly(7)  # KeyEvent
             elif message_type == 5:
                 await reader.readexactly(5)  # PointerEvent
+            elif message_type == 6:
+                header = await reader.readexactly(7)  # padding + length
+                (length,) = struct.unpack("!I", header[3:7])
+                self.clipboard_texts.append(
+                    (await reader.readexactly(length)).decode("utf-8")
+                )
             else:
                 break
 
@@ -262,6 +269,26 @@ class TestCaptureRetry(unittest.IsolatedAsyncioTestCase):
                 await client.press("a")
                 self.assertGreater(client.last_input_time, input_after_connect)
                 self.assertGreater(client.last_input_time, frame_time)
+            finally:
+                await client.close()
+        finally:
+            server.close()
+
+    async def test_set_clipboard_sends_client_cut_text(self):
+        """set_clipboard serializes ClientCutText the server can frame."""
+        server = ScriptedUpdateServer([full_update])
+        port = await server.start()
+        try:
+            client = await VNCClient.connect(config(port))
+            try:
+                await client.set_clipboard("DISM output, pasted verbatim")
+                await client.set_clipboard("emoji ✨ utf-8 fallback")
+                deadline = time.monotonic() + 2.0
+                while len(server.clipboard_texts) < 2 and time.monotonic() < deadline:
+                    await asyncio.sleep(0.05)
+                self.assertEqual(
+                    server.clipboard_texts, ["DISM output, pasted verbatim", "emoji ✨ utf-8 fallback"]
+                )
             finally:
                 await client.close()
         finally:
