@@ -8,6 +8,8 @@ and sending keyboard & mouse input to VNC servers using asyncio.
 from __future__ import annotations
 
 import asyncio
+
+import time
 from contextlib import asynccontextmanager, AsyncExitStack
 import logging
 from secrets import token_bytes
@@ -126,11 +128,18 @@ class VNCClient:
 
         self._zlib_decompress = decompressobj().decompress
 
-        # internal state
+        # Clipboard (ServerCutText) tracking: the server pushes guest-clipboard
+        # changes here; stored so callers can read console output via `| clip`
+        # without OCR. Times are time.monotonic() seconds.
+        self.last_cut_text: Optional[str] = None
+        self.last_cut_text_time: float = 0.0
+
+        # Internal state
         self._pixels_rgba: Optional[np.ndarray] = None
         self._pixels_lock = asyncio.Lock()
         self._mouse_position: Point = Point(0, 0)  # not a literal type
         self._mouse_buttons: int = 0  # not a literal type
+        self.last_update_time: float = 0.0
 
         # Background task management
         self._running = False
@@ -635,11 +644,20 @@ class VNCClient:
                     await self._handle_framebuffer_update()
 
                 elif update_type == MSG_TYPE_SERVER_CUT_TEXT:
-                    # RFC 6143 section 7.6.4: padding(3), length(4), text. We do not
-                    # implement clipboard sync, but the payload must still be drained
-                    # in full or the stream desynchronises.
+                    # RFC 6143 section 7.6.4: padding(3), length(4), text. The
+                    # payload must be drained in full or the stream desynchronises.
                     await _read_bytes(self._reader, 3)  # padding
-                    await _read_bytes(self._reader, await _read_int(self._reader, 4))
+                    length = await _read_int(self._reader, 4)
+                    payload = await _read_bytes(self._reader, length)
+                    try:
+                        self.last_cut_text = payload.decode("utf-8")
+                    except UnicodeDecodeError:
+                        # RFC 6143 specifies ISO 8859-1 for cut text.
+                        self.last_cut_text = payload.decode("latin-1")
+                    self.last_cut_text_time = time.monotonic()
+                    logger.debug(
+                        "ServerCutText received (%d chars)", len(self.last_cut_text)
+                    )
 
                 elif update_type == MSG_TYPE_BELL:
                     # RFC 6143 section 7.6.3: a bare message type, no payload.
@@ -777,6 +795,7 @@ class VNCClient:
             self.last_capture_stale = False
 
         # Signal that new framebuffer data is available
+        self.last_update_time = time.monotonic()
         self._capture_event.set()
 
     # 0

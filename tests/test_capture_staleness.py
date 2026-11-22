@@ -9,6 +9,7 @@ success; now it retries, then flags ``last_capture_stale``.
 import asyncio
 import struct
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -204,6 +205,41 @@ class TestCaptureRetry(unittest.IsolatedAsyncioTestCase):
                 client._reader = reader
                 await client._handle_framebuffer_update()
                 self.assertFalse(client.last_capture_stale)
+            finally:
+                await client.close()
+        finally:
+            server.close()
+
+    async def test_server_cut_text_is_stored(self):
+        """A pushed ServerCutText is decoded, stored, and timestamped."""
+        server = ScriptedUpdateServer([full_update])
+        port = await server.start()
+        try:
+            client = await VNCClient.connect(config(port))
+            try:
+                self.assertIsNone(client.last_cut_text)
+                text = "Hello from the guest clipboard"
+                wire = (
+                    b"\x03"  # ServerCutText
+                    + b"\x00\x00\x00"
+                    + len(text).to_bytes(4, "big")
+                    + text.encode("utf-8")
+                )
+                reader = asyncio.StreamReader()
+                reader.feed_data(wire)
+                reader.feed_eof()
+                client._reader = reader
+                listener = asyncio.create_task(client._framebuffer_listener())
+                deadline = time.monotonic() + 2.0
+                while client.last_cut_text is None and time.monotonic() < deadline:
+                    await asyncio.sleep(0.05)
+                listener.cancel()
+                try:
+                    await listener
+                except asyncio.CancelledError:
+                    pass
+                self.assertEqual(client.last_cut_text, text)
+                self.assertGreater(client.last_cut_text_time, 0.0)
             finally:
                 await client.close()
         finally:
