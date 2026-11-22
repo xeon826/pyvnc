@@ -35,6 +35,11 @@ def empty_update():
     return framebuffer_update([])
 
 
+def silence():
+    """Script entry that answers an update request with nothing at all."""
+    return b""
+
+
 def full_update():
     # RAW encoding (0): the client keeps a single streaming zlib decompressor,
     # so independent zlib streams would desync its decoder.
@@ -128,6 +133,32 @@ class TestCaptureRetry(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(server.requests - requests_after_connect, 2)
                 self.assertEqual(array.shape, (HEIGHT, WIDTH, 4))
                 self.assertFalse(client.last_capture_stale)
+                self.assertEqual(client._last_update_rect_count, 1)
+            finally:
+                await client.close()
+        finally:
+            server.close()
+
+    async def test_capture_flags_stale_when_server_never_answers(self):
+        """Server fully silent (no update at all): timeout path retries and flags stale.
+
+        Regression for the field-reported variant: _last_update_rect_count keeps
+        its old >=1 value when no update ever arrives, so a count-only check
+        missed this case and returned stale pixels as success.
+        """
+        server = ScriptedUpdateServer([full_update, silence])
+        port = await server.start()
+        try:
+            client = await VNCClient.connect(config(port))
+            try:
+                self.assertFalse(client.last_capture_stale)
+                requests_before = server.requests
+                array = await client.capture(timeout=2.0)
+                # initial wait + 3 retries, each sending one request
+                self.assertEqual(server.requests - requests_before, 4)
+                self.assertEqual(array.shape, (HEIGHT, WIDTH, 4))
+                self.assertTrue(client.last_capture_stale)
+                # counter retains the last parsed update (the initial full frame)
                 self.assertEqual(client._last_update_rect_count, 1)
             finally:
                 await client.close()

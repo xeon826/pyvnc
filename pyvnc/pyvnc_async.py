@@ -918,21 +918,26 @@ class VNCClient:
             )
 
         if wait:
+            update_arrived = False
             try:
                 await asyncio.wait_for(self._capture_event.wait(), timeout=timeout)
+                update_arrived = True
             except asyncio.TimeoutError:
-                pass  # Return whatever we have
+                pass  # Handled by the retry loop below
 
-            # A server may answer a forced (non-incremental) full-frame request
-            # with a 0-rect update while its dirty-region pipeline is stalled
-            # (e.g. a Windows UAC/secure-desktop transition). That leaves the
-            # buffer unchanged and would silently return a stale frame as
-            # success, so retry with a fresh request before flagging the result.
+            # A stalled server may (a) answer a forced (non-incremental)
+            # full-frame request with a 0-rect update, or (b) not answer at
+            # all (e.g. a Windows UAC/secure-desktop transition wedging the
+            # dirty-region pipeline). Both leave the buffer unchanged and
+            # would silently return a stale frame as success, so re-request
+            # with a short wait before flagging the result.
             retries = 0
-            while self._last_update_rect_count == 0 and retries < 3:
+            while (not update_arrived or self._last_update_rect_count == 0) and retries < 3:
                 retries += 1
                 logger.debug(
-                    "forced full-frame update returned 0 rects; retry %d/3", retries
+                    "forced full-frame update stalled (%s); retry %d/3",
+                    "no update" if not update_arrived else "0 rects",
+                    retries,
                 )
                 self._capture_event.clear()
                 retry_success = await self._framebuffer_update_request(target_rect)
@@ -942,9 +947,12 @@ class VNCClient:
                     )
                 try:
                     await asyncio.wait_for(self._capture_event.wait(), timeout=2.0)
+                    update_arrived = True
                 except asyncio.TimeoutError:
-                    pass  # Return whatever we have
-            self.last_capture_stale = self._last_update_rect_count == 0
+                    update_arrived = False
+            self.last_capture_stale = (
+                not update_arrived or self._last_update_rect_count == 0
+            )
             if self.last_capture_stale:
                 logger.warning(
                     "forced full-frame update returned 0 rects %d time(s); "
