@@ -140,6 +140,9 @@ class VNCClient:
         self._mouse_position: Point = Point(0, 0)  # not a literal type
         self._mouse_buttons: int = 0  # not a literal type
         self.last_update_time: float = 0.0
+        # Monotonic timestamp of the most recent key/mouse event WE sent;
+        # lets clients detect frames that predate their own recent input.
+        self.last_input_time: float = 0.0
 
         # Background task management
         self._running = False
@@ -554,6 +557,7 @@ class VNCClient:
                     # _safe_write: we still hold the reconnect flag, and _safe_write
                     # would block waiting for this very reconnect to finish.
                     await self._write_direct(self._pointer_event())
+                    self.last_input_time = time.monotonic()
 
                     logger.info("VNC reconnection successful")
                     return True
@@ -990,6 +994,7 @@ class VNCClient:
     @asynccontextmanager
     async def _write_key(self, key: str) -> AsyncIterator["VNCClient"]:
         data = key_codes[key].to_bytes(4, "big")
+        self.last_input_time = time.monotonic()
         success = await self._safe_write(b"\x04\x01\x00\x00" + data)
         if not success:
             raise ConnectionError("Failed to send key press - connection down")
@@ -1008,6 +1013,7 @@ class VNCClient:
         )
 
     async def _write_mouse(self) -> None:
+        self.last_input_time = time.monotonic()
         await self._safe_write(self._pointer_event())
 
     @asynccontextmanager

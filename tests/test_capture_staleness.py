@@ -245,6 +245,28 @@ class TestCaptureRetry(unittest.IsolatedAsyncioTestCase):
         finally:
             server.close()
 
+    async def test_input_timestamp_postdates_frame_timestamp(self):
+        """last_input_time starts below the frame time and moves past it on input."""
+        server = ScriptedUpdateServer([full_update])
+        port = await server.start()
+        try:
+            client = await VNCClient.connect(config(port))
+            try:
+                frame_time = client.last_update_time
+                self.assertGreater(frame_time, 0.0)
+                # connect() restores the mouse position, so input_time is set;
+                # typing must push it strictly past the last frame parse.
+                input_after_connect = client.last_input_time
+                self.assertGreater(input_after_connect, 0.0)
+                await asyncio.sleep(0.01)
+                await client.press("a")
+                self.assertGreater(client.last_input_time, input_after_connect)
+                self.assertGreater(client.last_input_time, frame_time)
+            finally:
+                await client.close()
+        finally:
+            server.close()
+
 
 if __name__ == "__main__":
     unittest.main()
