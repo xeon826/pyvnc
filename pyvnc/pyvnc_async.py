@@ -145,6 +145,14 @@ class VNCClient:
         self._reconnect_event.set()  # Initially not reconnecting
         self._last_error: Optional[Exception] = None
 
+        # Stale-capture detection: a forced full-frame update answered with zero
+        # rectangles means the server sent no new pixels (e.g. its dirty-region
+        # pipeline is stalled during a Windows UAC/secure-desktop transition).
+        # capture() retries and, if it still gets nothing, flags the buffer as
+        # possibly stale via last_capture_stale.
+        self.last_capture_stale: bool = False
+        self._last_update_rect_count: int = -1
+
     async def _perform_handshake(self) -> None:
         """Perform VNC protocol handshake and authentication.
 
@@ -466,7 +474,6 @@ class VNCClient:
     async def _cleanup_connection(self) -> None:
         """Clean up the current connection resources."""
         self._connected = False
-
         if self._writer is not None:
             try:
                 self._writer.close()
@@ -574,6 +581,19 @@ class VNCClient:
         finally:
             self._reconnecting = False
             self._reconnect_event.set()
+
+    async def reconnect(self) -> bool:
+        """Force a reconnect, discarding the current stream.
+
+        Opens a fresh connection (full handshake + authentication) and resets
+        all server-side client state. This is the reliable cure for a wedged
+        server update pipeline: it recovers even when incremental updates keep
+        coming back empty.
+
+        Returns:
+            True if reconnection succeeded, False otherwise.
+        """
+        return await self._reconnect()
 
     async def close(self) -> None:
         """Close the VNC connection and stop background task."""
@@ -750,6 +770,12 @@ class VNCClient:
                     255  # Set alpha channel
                 )
 
+        # Record what this update actually delivered so capture() can detect an
+        # empty update, and a real update clears the stale flag.
+        self._last_update_rect_count = num_rects
+        if num_rects > 0:
+            self.last_capture_stale = False
+
         # Signal that new framebuffer data is available
         self._capture_event.set()
 
@@ -896,6 +922,35 @@ class VNCClient:
                 await asyncio.wait_for(self._capture_event.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 pass  # Return whatever we have
+
+            # A server may answer a forced (non-incremental) full-frame request
+            # with a 0-rect update while its dirty-region pipeline is stalled
+            # (e.g. a Windows UAC/secure-desktop transition). That leaves the
+            # buffer unchanged and would silently return a stale frame as
+            # success, so retry with a fresh request before flagging the result.
+            retries = 0
+            while self._last_update_rect_count == 0 and retries < 3:
+                retries += 1
+                logger.debug(
+                    "forced full-frame update returned 0 rects; retry %d/3", retries
+                )
+                self._capture_event.clear()
+                retry_success = await self._framebuffer_update_request(target_rect)
+                if not retry_success:
+                    raise ConnectionError(
+                        "Failed to send framebuffer request - connection down"
+                    )
+                try:
+                    await asyncio.wait_for(self._capture_event.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass  # Return whatever we have
+            self.last_capture_stale = self._last_update_rect_count == 0
+            if self.last_capture_stale:
+                logger.warning(
+                    "forced full-frame update returned 0 rects %d time(s); "
+                    "returning possibly-stale framebuffer",
+                    retries,
+                )
 
         async with self._pixels_lock:
             if self._pixels_rgba is None:
